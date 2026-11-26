@@ -90,6 +90,27 @@ cd src-tauri && cargo test -p videoclip-core
 
 ### 打包
 
+**Windows 一键打包**：双击 `platforms\windows\build.cmd`。脚本会检查环境、安装依赖、编译，最后打开 `release` 文件夹，里面有两个文件：
+
+- `VideoClip_<版本>_x64-setup.exe`：安装包，双击安装，不需要管理员权限
+- `VideoClip_<版本>_x64.exe`：免安装版，直接双击运行
+
+首次打包前需要先装好以下环境（各装一次即可）：
+
+```powershell
+winget install OpenJS.NodeJS.LTS
+```
+
+```powershell
+winget install Rustlang.Rustup
+```
+
+```powershell
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+**其他平台 / 手动打包**：
+
 ```bash
 npm run app:build
 ```
