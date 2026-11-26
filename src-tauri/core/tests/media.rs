@@ -108,3 +108,36 @@ fn library_roundtrip_and_export() {
     let only = vec!["r1".to_string()];
     assert_eq!(export::export_xlsx(&lib, Some(&only), 480, &dir.join("one.xlsx")).unwrap(), 1);
 }
+
+/// 采样表：每个采样的位置和 ffprobe 一致，帧序号和 probe 的 pts 一一对应
+#[test]
+fn sample_table_matches_ffprobe() {
+    for (file, codec_prefix) in [("cfr30_bframes.mp4", "avc1."), ("vfr.mp4", "avc1."), ("hevc600.mov", "hvc1.")] {
+        let info = media::probe(&fixture(file)).unwrap();
+        let t = media::sample_table(&fixture(file)).unwrap();
+        assert!(t.codec.starts_with(codec_prefix), "{file}: {}", t.codec);
+        assert!(!t.description.is_empty());
+        assert_eq!(t.offsets.len(), t.sizes.len());
+        assert!(t.keys[0], "{file}: 第一个采样应当是关键帧");
+        // 每一帧恰好对应一个采样
+        let mut seen = vec![0; info.frame_count];
+        for f in &t.frames {
+            if *f >= 0 {
+                seen[*f as usize] += 1;
+            }
+        }
+        assert!(seen.iter().all(|c| *c == 1), "{file}: {seen:?}");
+        // 和 ffprobe 的 packet 位置对比
+        let want: Vec<(u64, u32, bool)> = std::fs::read_to_string(fixture(&format!("{file}.packets")))
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let c: Vec<&str> = l.split(',').collect();
+                // ffprobe 输出顺序：size,pos,flags
+                (c[1].parse().unwrap(), c[0].parse().unwrap(), c[2].starts_with('K'))
+            })
+            .collect();
+        let got: Vec<(u64, u32, bool)> = (0..t.offsets.len()).map(|i| (t.offsets[i], t.sizes[i], t.keys[i])).collect();
+        assert_eq!(got, want, "{file}");
+    }
+}

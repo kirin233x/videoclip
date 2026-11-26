@@ -24,6 +24,7 @@ import {
 import { api, fileSrc, MeasureRecord, pickVideo, pickVideos, revealFile, VideoEntry } from "../api";
 import Timeline from "../components/Timeline";
 import { Kbd, Menu, MenuItem, Spinner, useToast } from "../components/ui";
+import { drawFrame, FrameDecoder } from "../decoder";
 import { useFramePlayer } from "../player";
 import { ProbeState, useStore } from "../store";
 import { fmt1, fmtClock, fmtInt, fmtSize, isMac, labelColor, labelOf, splitMs } from "../utils";
@@ -154,8 +155,57 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
   const t0 = measurePts[0] ?? 0;
   const msOf = useCallback((i: number) => (measurePts[i] - t0) * 1000, [measurePts, t0]);
 
-  const player = useFramePlayer(videoRef, play.pts, src, s.settings.rate ?? 1);
+  // WebCodecs 逐帧解码缓存；不支持时为 null，退回 <video> seek
+  const playFile = video.playPath || video.path;
+  const [decoder, setDecoder] = useState<FrameDecoder | null>(null);
+  useEffect(() => {
+    let alive = true;
+    let made: FrameDecoder | null = null;
+    api
+      .sampleTable(playFile)
+      .then((t) => FrameDecoder.create(playFile, t, play.pts.length))
+      .then((d) => {
+        if (alive) setDecoder((made = d));
+        else d?.dispose();
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+      made?.dispose();
+    };
+  }, [playFile, play.pts.length]);
+
+  const player = useFramePlayer(videoRef, play.pts, src, s.settings.rate ?? 1, decoder);
   const { cur, count, seek, step, toggle } = player;
+
+  // 画布上画的是哪一帧
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [canvasFrame, setCanvasFrame] = useState(-1);
+  const [decoderFailed, setDecoderFailed] = useState(false);
+  const curRef = useRef(cur);
+  curRef.current = cur;
+  useEffect(() => {
+    if (!decoder) return;
+    const draw = (f: number) => {
+      if (f === -1) setDecoderFailed(true);
+      if (f !== curRef.current || !canvasRef.current) return;
+      const bmp = decoder.get(f);
+      if (!bmp) return;
+      drawFrame(canvasRef.current, bmp, info.rotation);
+      setCanvasFrame(f);
+    };
+    draw(cur);
+    return decoder.subscribe(draw);
+  }, [decoder, cur, info.rotation]);
+
+  // 显示哪一层：画布正好是当前帧就用画布；否则 <video> 正好是当前帧就用 video；
+  // 都不是（正在解码）就先显示画布上的旧画面并提示加载中
+  const decoderOn = !!decoder && !decoderFailed;
+  const exactCanvas = canvasFrame === cur;
+  const exactVideo = player.videoFrame === cur;
+  const canvasCloser = canvasFrame >= 0 && Math.abs(canvasFrame - cur) <= Math.abs(player.videoApprox - cur);
+  const showCanvas = decoderOn && !player.playing && (exactCanvas || (!exactVideo && canvasCloser));
+  const decoding = decoderOn && !player.playing && !exactCanvas && !exactVideo;
 
   const marks = s.marks[video.id] ?? { start: null, end: null };
   const { start, end } = marks;
@@ -375,8 +425,15 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
       <div className="m-body">
         {/* ---------------------------------------------------- 播放器 */}
         <section className="player panel">
-          <div className="stage">
+          <div className="stage" data-shown-frame={showCanvas ? canvasFrame : player.videoFrame} data-decoder={decoderOn ? "webcodecs" : "video"}>
             <video ref={videoRef} src={src} preload="auto" muted playsInline disablePictureInPicture />
+            <canvas ref={canvasRef} className="stage-canvas" style={{ visibility: showCanvas ? "visible" : "hidden" }} />
+            {decoding && (
+              <div className="stage-decoding" title="正在从关键帧解码">
+                <Spinner size={14} />
+                解码中
+              </div>
+            )}
             <div className="stage-top">
               <span className="pill">
                 第 <b>{fmtInt(cur + 1)}</b> / {fmtInt(count)} 帧

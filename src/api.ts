@@ -57,6 +57,19 @@ export interface Library {
   settings: Settings | null;
 }
 
+/** WebCodecs 逐帧解码用的采样表（按解码顺序） */
+export interface SampleTable {
+  codec: string;
+  description: number[];
+  codedWidth: number;
+  codedHeight: number;
+  offsets: number[];
+  sizes: number[];
+  keys: boolean[];
+  /** 对应 VideoInfo.pts 里的第几帧，-1 表示不显示 */
+  frames: number[];
+}
+
 export interface Tools {
   ffmpeg: string | null;
   ffprobe: string | null;
@@ -113,6 +126,15 @@ export const api = {
   loadLibrary: (): Promise<Library> => (inTauri ? invoke("load_library") : mock.loadLibrary()),
   saveLibrary: (library: Library): Promise<void> => (inTauri ? invoke("save_library", { library }) : mock.saveLibrary(library)),
   probeVideo: (path: string): Promise<VideoInfo> => (inTauri ? invoke("probe_video", { path }) : mock.probeVideo(path)),
+  sampleTable: (path: string): Promise<SampleTable> =>
+    inTauri ? invoke("sample_table", { path }) : fetch(path + ".samples.json").then((r) => (r.ok ? r.json() : Promise.reject(new Error("no samples")))),
+  /** 读取文件中的一段原始字节 */
+  readSpan: async (path: string, offset: number, len: number): Promise<Uint8Array> => {
+    if (inTauri) return new Uint8Array(await invoke<ArrayBuffer>("read_span", { path, offset, len }));
+    const r = await fetch(path, { headers: { Range: `bytes=${offset}-${offset + len - 1}` } });
+    const buf = new Uint8Array(await r.arrayBuffer());
+    return r.status === 206 ? buf : buf.subarray(offset, offset + len);
+  },
   toolsStatus: (): Promise<Tools> => (inTauri ? invoke("tools_status") : Promise.resolve({ ffmpeg: null, ffprobe: null })),
   transcodeVideo: (path: string): Promise<string> =>
     inTauri ? invoke("transcode_video", { path }) : Promise.reject(new Error("浏览器预览不支持转码")),

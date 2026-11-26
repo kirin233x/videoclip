@@ -20,6 +20,17 @@ VideoClip 直接读取 MP4 / MOV 容器里的采样表（`stts` / `ctts` / `elst
 
 界面上显示的帧号以 WebView 实际显示的那一帧为准（通过 `requestVideoFrameCallback` 获取），所以帧号、时间和画面始终对得上。仓库里有可变帧率 + B 帧 + 编辑列表的测试视频，解析结果和 ffprobe 逐帧对比一致。
 
+## 为什么逐帧不卡
+
+手机录屏的关键帧间隔通常很长（安卓 `screenrecord` 默认 10 秒一个关键帧）。用 `<video>` 的 seek 做逐帧，每一步都要从前一个关键帧重新解码，越靠后越慢。1080×2400 的录屏实测单步要 750ms 以上，按住方向键 1 秒，画面只刷新 3 次。
+
+所以暂停时的逐帧操作改用 **WebCodecs** 自己解码：
+- 解码器一直保持打开，往前走一帧只需再解一帧。
+- 解好的帧缓存成位图（约 380MB 上限），往回走直接从缓存里取，空闲时还会往回预取一段。
+- 随机跳到很远的位置时，同时让 `<video>` 也去 seek，哪个先好先显示哪个。
+
+同样的视频，单步降到 10–30ms，按住方向键每一帧都能刷新出来。每个解出来的帧都带着自己的帧号，所以画面和帧号天然一致。播放仍然用 `<video>`。系统不支持 WebCodecs，或者不支持这种编码时，会自动退回 `<video>` seek。
+
 ## 快捷键（测量页）
 
 | 按键 | 作用 |
@@ -90,6 +101,7 @@ npm run app:build
 ```
 src/                      前端（React + TypeScript）
   player.ts               逐帧播放：seek 排队、帧号以实际显示帧为准、时间偏移校准
+  decoder.ts              WebCodecs 逐帧解码与帧缓存
   pages/Measure.tsx       逐帧测量页
   pages/Records.tsx       记录汇总页
 src-tauri/

@@ -64,6 +64,12 @@ struct RawTrack {
     pts: Vec<f64>,
     /// 最后一帧的持续时间（秒），未知时为 None
     last_duration: Option<f64>,
+    /// 按解码顺序的每个采样的显示时间（未过滤），用于 WebCodecs 解码
+    decode_pts: Vec<f64>,
+    /// 解码器配置：（WebCodecs codec 字符串, avcC/hvcC 内容, 编码宽, 编码高）
+    decoder_config: Option<(String, Vec<u8>, u32, u32)>,
+    /// 按解码顺序的采样位置：（文件偏移, 大小, 是否关键帧）
+    samples: Vec<(u64, u32, bool)>,
 }
 
 fn finish(path: &Path, size: u64, mut t: RawTrack, source: &str) -> VideoInfo {
@@ -262,9 +268,27 @@ fn parse_video_trak(trak: &[u8], mdia: &[u8], movie_timescale: u32) -> Result<Ra
     let stsd = need(stbl, b"stsd")?;
     if let Some((kind, entry)) = children(stsd.get(8..).unwrap_or_default())?.into_iter().next() {
         t.codec = String::from_utf8_lossy(&kind).trim().to_string();
+        let coded_w = be_u16(entry, 24).unwrap_or(0) as u32;
+        let coded_h = be_u16(entry, 26).unwrap_or(0) as u32;
         if t.width == 0 || t.height == 0 {
-            t.width = be_u16(entry, 24).unwrap_or(0) as u32;
-            t.height = be_u16(entry, 26).unwrap_or(0) as u32;
+            t.width = coded_w;
+            t.height = coded_h;
+        }
+        // 视觉采样条目头部 78 字节之后是 avcC / hvcC 等子 box
+        if let Some(rest) = entry.get(78..) {
+            if let Ok(kids) = children(rest) {
+                for (k, body) in kids {
+                    let codec = match &k {
+                        b"avcC" => avc_codec_string(body),
+                        b"hvcC" => hevc_codec_string(&t.codec, body),
+                        _ => None,
+                    };
+                    if let Some(c) = codec {
+                        t.decoder_config = Some((c, body.to_vec(), coded_w, coded_h));
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -328,6 +352,11 @@ fn parse_video_trak(trak: &[u8], mdia: &[u8], movie_timescale: u32) -> Result<Ra
             dts += *delta as i64;
         }
     }
+    t.decode_pts = pts.clone();
+    if t.decoder_config.is_some() {
+        // 采样表只在可以用 WebCodecs 解码时才需要；解析失败不影响读取时间
+        t.samples = sample_locations(stbl, total as usize).unwrap_or_default();
+    }
     // 编辑列表之前的帧不会显示（解码预滚），去掉
     pts.retain(|p| *p > -1e-9);
     if pts.is_empty() {
@@ -336,6 +365,156 @@ fn parse_video_trak(trak: &[u8], mdia: &[u8], movie_timescale: u32) -> Result<Ra
     t.pts = pts;
     t.last_duration = deltas.last().map(|(_, d)| *d as f64 / timescale as f64);
     Ok(t)
+}
+
+/// 每个采样在文件里的位置（stsz + stco/co64 + stsc）和是否关键帧（stss）
+fn sample_locations(stbl: &[u8], total: usize) -> Result<Vec<(u64, u32, bool)>> {
+    let stsz = need(stbl, b"stsz")?;
+    let fixed = be_u32(stsz, 4)?;
+    let count = be_u32(stsz, 8)? as usize;
+    if count != total {
+        bail!("采样数不一致");
+    }
+    let size_of = |i: usize| -> Result<u32> { if fixed != 0 { Ok(fixed) } else { be_u32(stsz, 12 + i * 4) } };
+
+    let chunk_offsets: Vec<u64> = if let Some(stco) = child(stbl, b"stco")? {
+        (0..be_u32(stco, 4)? as usize).map(|i| be_u32(stco, 8 + i * 4).map(|v| v as u64)).collect::<Result<_>>()?
+    } else {
+        let co64 = need(stbl, b"co64")?;
+        (0..be_u32(co64, 4)? as usize).map(|i| be_u64(co64, 8 + i * 8)).collect::<Result<_>>()?
+    };
+
+    let stsc = need(stbl, b"stsc")?;
+    let n = be_u32(stsc, 4)? as usize;
+    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(n); // (first_chunk, samples_per_chunk)
+    for i in 0..n {
+        runs.push((be_u32(stsc, 8 + i * 12)?, be_u32(stsc, 12 + i * 12)?));
+    }
+
+    let sync: Option<Vec<u32>> = match child(stbl, b"stss")? {
+        Some(stss) => Some((0..be_u32(stss, 4)? as usize).map(|i| be_u32(stss, 8 + i * 4)).collect::<Result<_>>()?),
+        None => None, // 没有 stss 表示每一帧都是关键帧
+    };
+
+    let mut out = Vec::with_capacity(total);
+    let mut sample = 0usize;
+    for (ci, base) in chunk_offsets.iter().enumerate() {
+        let chunk_no = ci as u32 + 1;
+        let per = runs.iter().rev().find(|(first, _)| *first <= chunk_no).map(|(_, n)| *n).unwrap_or(0);
+        let mut off = *base;
+        for _ in 0..per {
+            if sample >= total {
+                break;
+            }
+            let size = size_of(sample)?;
+            let key = sync.as_ref().is_none_or(|s| s.binary_search(&(sample as u32 + 1)).is_ok());
+            out.push((off, size, key));
+            off += size as u64;
+            sample += 1;
+        }
+    }
+    if out.len() != total {
+        bail!("采样表不完整");
+    }
+    Ok(out)
+}
+
+fn hex2(v: u8) -> String {
+    format!("{v:02x}")
+}
+
+/// avcC → "avc1.64002a"
+fn avc_codec_string(avcc: &[u8]) -> Option<String> {
+    let b = avcc.get(1..4)?;
+    Some(format!("avc1.{}{}{}", hex2(b[0]), hex2(b[1]), hex2(b[2])))
+}
+
+/// hvcC → "hvc1.1.6.L153.B0"（ISO/IEC 14496-15 附录 E）
+fn hevc_codec_string(fourcc: &str, h: &[u8]) -> Option<String> {
+    if h.len() < 13 {
+        return None;
+    }
+    let space = ["", "A", "B", "C"][(h[1] >> 6) as usize];
+    let tier = if h[1] & 0x20 != 0 { "H" } else { "L" };
+    let profile = h[1] & 0x1f;
+    let compat = u32::from_be_bytes([h[2], h[3], h[4], h[5]]).reverse_bits();
+    let level = h[12];
+    let mut cons: Vec<u8> = h[6..12].to_vec();
+    while cons.last() == Some(&0) {
+        cons.pop();
+    }
+    let mut s = format!("{}.{space}{profile}.{compat:x}.{tier}{level}", if fourcc == "hev1" { "hev1" } else { "hvc1" });
+    for c in cons {
+        s.push('.');
+        s.push_str(&format!("{c:x}"));
+    }
+    Some(s)
+}
+
+// ------------------------------------------------------------------ WebCodecs 解码用的采样表
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleTable {
+    /// WebCodecs 的 codec 字符串，例如 avc1.64002a
+    pub codec: String,
+    /// avcC / hvcC 的内容，作为 VideoDecoder 的 description
+    pub description: Vec<u8>,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    /// 按解码顺序：文件偏移
+    pub offsets: Vec<u64>,
+    /// 按解码顺序：大小
+    pub sizes: Vec<u32>,
+    /// 按解码顺序：是否关键帧
+    pub keys: Vec<bool>,
+    /// 按解码顺序：对应 VideoInfo.pts 里的第几帧；-1 表示这个采样不显示（编辑列表之前的预滚）
+    pub frames: Vec<i64>,
+}
+
+/// 读取 WebCodecs 逐帧解码需要的采样表。帧序号和 [`probe`] 返回的 pts 一一对应。
+pub fn sample_table(path: &Path) -> Result<SampleTable> {
+    let t = parse_iso_bmff(path)?;
+    let (codec, description, coded_width, coded_height) =
+        t.decoder_config.clone().ok_or_else(|| anyhow!("不支持用 WebCodecs 解码 {}", t.codec))?;
+    if t.samples.len() != t.decode_pts.len() {
+        bail!("采样表不完整");
+    }
+    // 和 probe 一样得到显示顺序的帧时间表，再把每个采样映射到帧序号
+    let info = finish(path, 0, RawTrack { pts: t.pts.clone(), ..Default::default() }, "container");
+    let frames = t
+        .decode_pts
+        .iter()
+        .map(|p| {
+            if *p <= -1e-9 {
+                return -1;
+            }
+            let i = info.pts.partition_point(|x| *x < p - 1e-9);
+            if i < info.pts.len() && (info.pts[i] - p).abs() < 1e-6 { i as i64 } else { -1 }
+        })
+        .collect();
+    Ok(SampleTable {
+        codec,
+        description,
+        coded_width,
+        coded_height,
+        offsets: t.samples.iter().map(|s| s.0).collect(),
+        sizes: t.samples.iter().map(|s| s.1).collect(),
+        keys: t.samples.iter().map(|s| s.2).collect(),
+        frames,
+    })
+}
+
+/// 读取文件中的一段字节（给 WebCodecs 解码用）
+pub fn read_span(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
+    if len > 256 << 20 {
+        bail!("一次读取太多");
+    }
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 // ------------------------------------------------------------------ ffprobe
@@ -427,6 +606,7 @@ fn parse_ffprobe_json(json: &[u8]) -> Result<RawTrack> {
         codec: s.codec_name.clone().unwrap_or_default(),
         pts,
         last_duration: last,
+        ..Default::default()
     })
 }
 

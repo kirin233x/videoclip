@@ -1,6 +1,7 @@
 //! 调试用：
 //!   cargo run --example probe -- <视频>              打印视频信息
 //!   cargo run --example probe -- <视频> --json       输出完整 JSON（含每帧时间）
+//!   cargo run --example probe -- <视频> --samples    输出 WebCodecs 解码用的采样表 JSON
 //!   cargo run --example probe -- <视频> <转码输出>   测试转码并对比时间戳
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -15,6 +16,7 @@ fn main() {
     });
     match args.get(2).map(String::as_str) {
         Some("--json") => println!("{}", serde_json::to_string(&v).unwrap()),
+        Some("--samples") => println!("{}", serde_json::to_string(&videoclip_core::media::sample_table(p).unwrap()).unwrap()),
         Some(out) => {
             videoclip_core::media::transcode_h264(p, std::path::Path::new(out)).unwrap();
             let t = videoclip_core::media::probe(std::path::Path::new(out)).unwrap();

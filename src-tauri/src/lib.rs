@@ -47,6 +47,28 @@ async fn probe_video(app: AppHandle, path: String) -> CmdResult<media::VideoInfo
     tauri::async_runtime::spawn_blocking(move || media::probe(&p)).await.map_err(err)?.map_err(err)
 }
 
+/// WebCodecs 逐帧解码用的采样表
+#[tauri::command]
+async fn sample_table(path: String) -> CmdResult<media::SampleTable> {
+    tauri::async_runtime::spawn_blocking(move || media::sample_table(Path::new(&path))).await.map_err(err)?.map_err(err)
+}
+
+/// 读取视频文件的一段原始字节，以二进制返回（不经过 JSON）
+#[tauri::command]
+async fn read_span(path: String, offset: u64, len: u64) -> CmdResult<tauri::ipc::Response> {
+    // 只允许读视频文件
+    const EXTS: [&str; 8] = ["mp4", "mov", "m4v", "3gp", "mkv", "webm", "avi", "ts"];
+    let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !EXTS.contains(&ext.as_str()) {
+        return Err("只能读取视频文件".into());
+    }
+    let bytes = tauri::async_runtime::spawn_blocking(move || media::read_span(Path::new(&path), offset, len))
+        .await
+        .map_err(err)?
+        .map_err(err)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Tools {
@@ -104,6 +126,8 @@ pub fn run() {
             load_library,
             save_library,
             probe_video,
+            sample_table,
+            read_span,
             tools_status,
             transcode_video,
             export_xlsx

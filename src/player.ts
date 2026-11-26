@@ -8,8 +8,11 @@
 // 4. 浏览器的时间轴可能和容器时间戳差一个常数（编辑列表处理方式不同），
 //    用第一帧显示时的 mediaTime 校准这个偏移。
 // 5. 连续按方向键时 seek 会排队，只执行最新的目标，不会卡住。
+// 6. 有 WebCodecs 解码器（decoder.ts）时，暂停状态下的逐帧移动完全不碰 <video>，
+//    由解码缓存直接出图；只有开始播放时才把 <video> 对齐到当前帧。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { FrameDecoder } from "./decoder";
 import { lowerIndex } from "./utils";
 
 type VideoWithRVFC = HTMLVideoElement & {
@@ -32,6 +35,10 @@ export interface FramePlayer {
   pause: () => void;
   /** 时间（秒，容器时间） → 帧 */
   frameAt: (t: number) => number;
+  /** <video> 元素当前确定显示的帧；正在 seek 或刚暂停还没对齐时为 -1 */
+  videoFrame: number;
+  /** <video> 元素大概显示的帧（最后一次回调报告的，可能差一帧） */
+  videoApprox: number;
 }
 
 export function useFramePlayer(
@@ -39,12 +46,25 @@ export function useFramePlayer(
   pts: number[] | null,
   src: string | null,
   initialRate = 1,
+  decoder: FrameDecoder | null = null,
 ): FramePlayer {
   const [cur, setCur] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rate, setRateState] = useState(initialRate);
+  const [videoApprox, setVideoApprox] = useState(-1);
+  const [videoExact, setVideoExact] = useState(false);
+  /** seek() 里自己调用的 pause，不要当成用户暂停处理 */
+  const pauseBySeekRef = useRef(false);
+  const decRef = useRef(decoder);
+  decRef.current = decoder;
+  /** 逐帧走的时候没有 seek <video>，播放前需要先对齐 */
+  const videoStaleRef = useRef(false);
+  const useDecoder = () => {
+    const d = decRef.current;
+    return !!d && !d.failed && !!ref.current?.paused;
+  };
 
   const curRef = useRef(0);
   const offsetRef = useRef<number | null>(null);
@@ -85,8 +105,23 @@ export function useFramePlayer(
       const n = ptsRef.current.length;
       if (!v || !n) return;
       const i = Math.max(0, Math.min(n - 1, Math.round(frame)));
-      if (!v.paused) v.pause();
+      if (!v.paused) {
+        pauseBySeekRef.current = true;
+        v.pause();
+      }
       setFrame(i);
+      if (useDecoder()) {
+        const d = decRef.current!;
+        const cheap = d.isCheap(i);
+        d.request(i);
+        if (cheap) {
+          videoStaleRef.current = true;
+          return;
+        }
+        // 缓存里没有、要从关键帧重新解：<video> 也同时 seek，谁先好就先显示谁
+        videoStaleRef.current = false;
+      }
+      setVideoExact(false);
       if (v.seeking) {
         pendingRef.current = i;
       } else {
@@ -105,8 +140,11 @@ export function useFramePlayer(
     const v = ref.current;
     if (!v) return;
     if (v.paused) {
-      // 在最后一帧时从头播放
+      // 在最后一帧时从头播放；逐帧走过之后先把 <video> 对齐到当前帧
       if (curRef.current >= ptsRef.current.length - 1) v.currentTime = targetOf(0);
+      else if (videoStaleRef.current) v.currentTime = targetOf(curRef.current);
+      videoStaleRef.current = false;
+      pendingRef.current = null;
       v.play().catch(() => {});
     } else v.pause();
   }, [ref, targetOf]);
@@ -126,9 +164,18 @@ export function useFramePlayer(
     setPlaying(false);
     setReady(false);
     setError(null);
+    setVideoApprox(-1);
+    setVideoExact(false);
+    pauseBySeekRef.current = false;
     offsetRef.current = null;
     pendingRef.current = null;
+    videoStaleRef.current = false;
   }, [src]);
+
+  // 解码器就绪后先把当前帧解出来
+  useEffect(() => {
+    decoder?.request(curRef.current);
+  }, [decoder]);
 
   useEffect(() => {
     const v = ref.current as VideoWithRVFC | null;
@@ -145,8 +192,13 @@ export function useFramePlayer(
         if (Math.abs(off) > 1e-4) console.info("[videoclip] 时间偏移校准", off);
         return;
       }
+      const f = lowerIndex(ptsRef.current, t - offset() + 0.0005);
+      setVideoApprox(f);
       if (pendingRef.current !== null || v.seeking) return;
-      setFrame(lowerIndex(ptsRef.current, t - offset() + 0.0005));
+      setVideoExact(true);
+      // 解码器模式下暂停时，帧号由逐帧操作决定，忽略 <video> 迟到的回调
+      if (v.paused && decRef.current && !decRef.current.failed && videoStaleRef.current) return;
+      setFrame(f);
     };
 
     const hasRVFC = typeof v.requestVideoFrameCallback === "function";
@@ -183,13 +235,34 @@ export function useFramePlayer(
       if (p !== null) {
         pendingRef.current = null;
         v.currentTime = targetOf(p);
-      } else if (!hasRVFC) syncFromCurrentTime();
+      } else {
+        // 我们总是 seek 到帧的中点，所以这里的 currentTime 能准确对应到帧
+        setVideoApprox(lowerIndex(ptsRef.current, v.currentTime - offset() + 0.0005));
+        setVideoExact(true);
+        if (!hasRVFC) syncFromCurrentTime();
+      }
     };
     const onPlay = () => {
       setPlaying(true);
       if (!hasRVFC) raf = requestAnimationFrame(rafLoop);
     };
-    const onPause = () => setPlaying(false);
+    const onPause = () => {
+      setPlaying(false);
+      if (pauseBySeekRef.current) {
+        pauseBySeekRef.current = false;
+        return;
+      }
+      // 用户暂停：暂停瞬间 <video> 可能又换了一帧却没有回调，
+      // 按 currentTime 定下当前帧，并把 <video> 对齐到这一帧的中点
+      if (v.ended) return;
+      const f = lowerIndex(ptsRef.current, v.currentTime - offset() + 0.0005);
+      setFrame(f);
+      setVideoExact(false);
+      videoStaleRef.current = false;
+      pendingRef.current = null;
+      v.currentTime = targetOf(f);
+      decRef.current?.request(f);
+    };
     const onError = () => {
       const code = v.error?.code;
       setError(
@@ -225,5 +298,6 @@ export function useFramePlayer(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ref, src, pts, targetOf]);
 
-  return { cur, count, playing, ready, error, rate, setRate, seek, step, toggle, pause, frameAt };
+  const videoFrame = videoExact ? videoApprox : -1;
+  return { cur, count, playing, ready, error, rate, setRate, seek, step, toggle, pause, frameAt, videoFrame, videoApprox };
 }
