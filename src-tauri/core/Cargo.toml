@@ -1,0 +1,13 @@
+[package]
+name = "videoclip-core"
+version = "0.1.0"
+edition = "2021"
+description = "VideoClip 核心：读取视频帧时间表、记录存储、导出 Excel"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust_xlsxwriter = "0.90"
+
+[dev-dependencies]
