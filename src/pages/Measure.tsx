@@ -169,6 +169,8 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
   const [menu, setMenu] = useState<HTMLElement | null>(null);
   const [transcoding, setTranscoding] = useState(false);
   const [showKeys, setShowKeys] = useState(false);
+  /** 当前高亮的已记录区间（点击记录或刚记录完） */
+  const [activeRec, setActiveRec] = useState<string | null>(null);
   const labelRef = useRef<HTMLInputElement>(null);
 
   // 从记录页「定位」过来
@@ -177,6 +179,7 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
   useEffect(() => {
     if (focus && focus.videoId === video.id && player.ready && focusDone.current !== focus.nonce) {
       focusDone.current = focus.nonce;
+      setActiveRec(focus.recordId);
       seek(focus.frame);
     }
   }, [focus, video.id, player.ready, seek]);
@@ -213,7 +216,9 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
       startMs: msOf(a),
       endMs: msOf(b),
     });
-    if (end === null) s.setMarks(video.id, { end: e });
+    // 配对成功的一段固定成记录，待配对的标记清空，开始标下一段
+    s.setMarks(video.id, { start: null, end: null });
+    setActiveRec(rec.id);
     setNote("");
     toast(
       <>
@@ -221,6 +226,33 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
       </>,
     );
   }, [start, end, cur, s, video.id, label, note, msOf, toast]);
+
+  const markerFrames = useMemo(() => {
+    const set = new Set<number>();
+    for (const r of records) {
+      set.add(r.startFrame);
+      set.add(r.endFrame);
+    }
+    if (start !== null) set.add(start);
+    if (end !== null) set.add(end);
+    return [...set].sort((a, b) => a - b);
+  }, [records, start, end]);
+
+  const jumpMarker = useCallback(
+    (dir: -1 | 1) => {
+      const f = dir < 0 ? [...markerFrames].reverse().find((x) => x < cur) : markerFrames.find((x) => x > cur);
+      if (f !== undefined) seek(f);
+    },
+    [markerFrames, cur, seek],
+  );
+
+  const openRecord = useCallback(
+    (r: MeasureRecord) => {
+      setActiveRec(r.id);
+      seek(r.startFrame);
+    },
+    [seek],
+  );
 
   const goVideo = useCallback(
     (d: number) => {
@@ -262,15 +294,15 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
       else if (k === "ArrowDown") goVideo(1);
       else if (k === "Escape") clearMarks();
       else if (k === "l" || k === "L") labelRef.current?.focus();
-      else if (k === "q" || k === "Q") start !== null && seek(start);
-      else if (k === "w" || k === "W") end !== null && seek(end);
+      else if (k === "q" || k === "Q") jumpMarker(-1);
+      else if (k === "w" || k === "W") jumpMarker(1);
       else if (/^[1-9]$/.test(k) && s.lib.labels[+k - 1]) setLabel(s.lib.labels[+k - 1]);
       else handled = false;
       if (handled) e.preventDefault();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [step, toggle, setStart, setEnd, record, seek, count, goVideo, clearMarks, start, end, s.lib.labels]);
+  }, [step, toggle, setStart, setEnd, record, seek, count, goVideo, clearMarks, jumpMarker, s.lib.labels]);
 
   // ------------------------------------------------------------ 转码
   const transcode = async () => {
@@ -305,6 +337,11 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
   const big = range ? splitMs(range.ms) : null;
   const atStart = start === cur;
   const atEnd = end === cur;
+  const recHits = records.flatMap((r) =>
+    [r.startFrame === cur ? { r, kind: "起点" } : null, r.endFrame === cur ? { r, kind: "终点" } : null].filter(
+      (x): x is { r: MeasureRecord; kind: string } => x !== null,
+    ),
+  );
 
   return (
     <div className="measure">
@@ -357,6 +394,12 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
                   <Flag size={12} /> 终点
                 </span>
               )}
+              {recHits.slice(0, 3).map(({ r, kind }) => (
+                <span key={r.id + kind} className="pill pill-rec">
+                  <i style={{ background: labelColor(r.label) }} />
+                  {labelOf(r.label)} · {kind}
+                </span>
+              ))}
             </div>
             {!player.ready && !player.error && (
               <div className="stage-cover">
@@ -382,8 +425,9 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
             start={start}
             end={end}
             records={records}
+            activeId={activeRec}
             onSeek={seek}
-            onRecordClick={(r) => s.focusRecord(r)}
+            onRecordClick={openRecord}
           />
 
           <div className="controls">
@@ -458,10 +502,16 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
               )}
             </div>
             <div className="mc-sub">
-              {range ? `${fmtInt(range.b - range.a)} 帧` : "按 S 标记起点，按 E 标记终点"}
+              {range
+                ? `${fmtInt(range.b - range.a)} 帧`
+                : start === null && end !== null
+                  ? "已标终点，按 S 标记起点"
+                  : records.length
+                    ? "按 S 标记下一段的起点"
+                    : "按 S 标记起点，按 E 标记终点"}
             </div>
             <div className="mc-points">
-              <button className={`mc-point ${atStart ? "here" : ""}`} disabled={start === null} onClick={() => start !== null && seek(start)} title="跳到起点 (Q)">
+              <button className={`mc-point ${atStart ? "here" : ""}`} disabled={start === null} onClick={() => start !== null && seek(start)} title="跳到这个起点">
                 <span className="mc-point-k">起点</span>
                 {start !== null ? (
                   <>
@@ -472,7 +522,7 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
                   <b className="dim">未标记</b>
                 )}
               </button>
-              <button className={`mc-point ${atEnd ? "here" : ""}`} disabled={end === null} onClick={() => end !== null && seek(end)} title="跳到终点 (W)">
+              <button className={`mc-point ${atEnd ? "here" : ""}`} disabled={end === null} onClick={() => end !== null && seek(end)} title="跳到这个终点">
                 <span className="mc-point-k">终点</span>
                 {end !== null ? (
                   <>
@@ -552,9 +602,12 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
                 <RecordRow
                   key={r.id}
                   r={r}
-                  active={start === r.startFrame && end === r.endFrame}
-                  onOpen={() => s.focusRecord(r)}
-                  onDelete={() => s.deleteRecords([r.id])}
+                  active={activeRec === r.id}
+                  onOpen={() => openRecord(r)}
+                  onDelete={() => {
+                    if (activeRec === r.id) setActiveRec(null);
+                    s.deleteRecords([r.id]);
+                  }}
                 />
               ))
             )}
@@ -579,9 +632,9 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
                 <Kbd>E</Kbd>
                 <span>当前帧设为终点</span>
                 <Kbd>Enter</Kbd>
-                <span>记录（没有终点时记录到当前帧）</span>
+                <span>记录这一对（没有终点时记录到当前帧），记录后标记清空</span>
                 <Kbd>Q W</Kbd>
-                <span>跳到起点 / 终点</span>
+                <span>跳到上一个 / 下一个标记点（含已记录的）</span>
                 <Kbd>1–9</Kbd>
                 <span>选择最近用过的标签</span>
                 <Kbd>L</Kbd>
@@ -589,7 +642,7 @@ function Workspace({ video, probe }: { video: VideoEntry; probe: ProbeState }) {
                 <Kbd>↑ ↓</Kbd>
                 <span>上一个 / 下一个视频</span>
                 <Kbd>Esc</Kbd>
-                <span>清除标记</span>
+                <span>清除未记录的标记</span>
               </div>
             )}
           </div>

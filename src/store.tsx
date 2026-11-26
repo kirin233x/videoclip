@@ -40,8 +40,8 @@ interface Store {
   deleteRecords: (ids: string[]) => void;
   marks: Record<string, Marks>;
   setMarks: (videoId: string, m: Partial<Marks>) => void;
-  /** 从记录页跳到某个视频的某一帧 */
-  focus: { videoId: string; frame: number; nonce: number } | null;
+  /** 定位到某条记录（跳到它的起点并高亮），不改动待配对的标记 */
+  focus: { videoId: string; frame: number; recordId: string; nonce: number } | null;
   focusRecord: (r: MeasureRecord) => void;
 }
 
@@ -274,12 +274,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const focusRecord = useCallback(
     (r: MeasureRecord) => {
-      setMarks(r.videoId, { start: r.startFrame, end: r.endFrame });
       setSelectedId(r.videoId);
       setRoute("measure");
-      setFocus({ videoId: r.videoId, frame: r.startFrame, nonce: Date.now() });
+      setFocus({ videoId: r.videoId, frame: r.startFrame, recordId: r.id, nonce: Date.now() });
     },
-    [setMarks],
+    [],
   );
 
   const value = useMemo<Store>(

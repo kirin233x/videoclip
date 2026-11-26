@@ -998,6 +998,14 @@ kbd {
   color: white;
   font-weight: 650;
 }
+.pill-rec {
+  color: white;
+}
+.pill-rec i {
+  width: 8px;
+  height: 8px;
+  border-radius: 3px;
+}
 .stage-cover {
   position: absolute;
   inset: 0;
@@ -1063,9 +1071,53 @@ kbd {
   opacity: 0.75;
   transition: opacity 0.15s, transform 0.12s;
 }
-.tl-record:hover {
+.tl-record:hover,
+.tl-record.active {
   opacity: 1;
   transform: scaleY(1.5);
+}
+.tl-record.active {
+  box-shadow: 0 0 0 2px var(--panel), 0 2px 6px rgba(30, 25, 90, 0.35);
+}
+.tl-saved {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.tl-saved-range {
+  position: absolute;
+  top: 9px;
+  height: 8px;
+  border-radius: 4px;
+  opacity: 0.35;
+}
+.tl-tick {
+  position: absolute;
+  top: 6px;
+  width: 2px;
+  height: 14px;
+  margin-left: -1px;
+  border-radius: 1px;
+  opacity: 0.7;
+}
+.tl-saved.active .tl-tick {
+  top: -6px;
+  height: 26px;
+  opacity: 1;
+}
+.tl-tick span {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 17px;
+  height: 15px;
+  border-radius: 5px;
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
 }
 .tl-track {
   position: relative;

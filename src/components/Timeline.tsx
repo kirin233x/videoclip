@@ -24,6 +24,8 @@ export default function Timeline(props: {
   start: number | null;
   end: number | null;
   records: MeasureRecord[];
+  /** 高亮的已记录区间 */
+  activeId?: string | null;
   onSeek: (frame: number) => void;
   onRecordClick: (r: MeasureRecord) => void;
 }) {
@@ -75,7 +77,7 @@ export default function Timeline(props: {
         {laid.map(({ r, lane, s, e }) => (
           <button
             key={r.id}
-            className="tl-record"
+            className={`tl-record ${props.activeId === r.id ? "active" : ""}`}
             title={`${labelOf(r.label)} · ${(r.endMs - r.startMs).toFixed(1)} ms`}
             style={{
               left: pct(s) + "%",
@@ -105,6 +107,22 @@ export default function Timeline(props: {
         onPointerLeave={() => setHover(null)}
       >
         <div className="tl-rail" />
+        {/* 已记录的区间：起点和终点在轨道上留下彩色刻度，高亮的那一段显示完整区间和旗标 */}
+        {laid.map(({ r, s, e }) => {
+          const color = labelColor(r.label);
+          const active = props.activeId === r.id;
+          return (
+            <div key={r.id} className={`tl-saved ${active ? "active" : ""}`}>
+              {active && <div className="tl-saved-range" style={{ left: pct(s) + "%", width: pct(e) - pct(s) + "%", background: color }} />}
+              <div className="tl-tick" style={{ left: pct(s) + "%", background: color }}>
+                {active && <span style={{ background: color }}>起</span>}
+              </div>
+              <div className="tl-tick" style={{ left: pct(e) + "%", background: color }}>
+                {active && <span style={{ background: color }}>终</span>}
+              </div>
+            </div>
+          );
+        })}
         {rs !== null && re !== null && (
           <div className="tl-range" style={{ left: pct(rs) + "%", width: pct(re) - pct(rs) + "%" }} />
         )}
